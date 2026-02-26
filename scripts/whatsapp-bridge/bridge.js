@@ -123,15 +123,23 @@ async function startSocket() {
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
 
-      // Skip own messages UNLESS it's a self-chat ("Message Yourself")
+      // For own messages: allow /start, /stop, /continue commands in ANY chat,
+      // but only queue regular messages from self-chat ("Message Yourself").
       if (msg.key.fromMe) {
-        // Always skip in groups and status
-        if (isGroup || chatId.includes('status')) continue;
-        // In DMs: only allow self-chat (remoteJid matches our own number)
-        const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const chatNumber = chatId.replace(/@.*/, '');
-        const isSelfChat = myNumber && chatNumber === myNumber;
-        if (!isSelfChat) continue;
+        // Quick-extract text to check for commands
+        const quickBody = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim().toLowerCase();
+        const isCommand = quickBody === '/start' || quickBody === '/continue' || quickBody === '/stop';
+
+        if (!isCommand) {
+          // Regular message: skip in groups and status
+          if (isGroup || chatId.includes('status')) continue;
+          // In DMs: only allow self-chat
+          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+          const chatNumber = chatId.replace(/@.*/, '');
+          const isSelfChat = myNumber && chatNumber === myNumber;
+          if (!isSelfChat) continue;
+        }
+        // Commands from owner fall through to be handled below
       }
 
       // Check allowlist for messages from others
