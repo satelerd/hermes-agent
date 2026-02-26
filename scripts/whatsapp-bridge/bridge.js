@@ -47,6 +47,19 @@ const MAX_QUEUE_SIZE = 100;
 let sock = null;
 let connectionState = 'disconnected';
 
+// Per-chat active/paused state (true = active, false = paused)
+// Default: paused (not in map means paused — user must /start first)
+const chatState = new Map();
+
+async function sendCommandResponse(chatId, text) {
+  if (!sock || connectionState !== 'connected') return;
+  try {
+    await sock.sendMessage(chatId, { text: `⚕ *Hermes Agent*\n────────────\n${text}` });
+  } catch (err) {
+    console.error('Failed to send command response:', err.message);
+  }
+}
+
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
@@ -155,6 +168,26 @@ async function startSocket() {
 
       // Skip empty messages
       if (!body && !hasMedia) continue;
+
+      // Handle /start, /continue, /stop commands (case-insensitive)
+      const trimmed = body.trim().toLowerCase();
+      if (trimmed === '/start' || trimmed === '/continue') {
+        const wasAlreadyActive = chatState.get(chatId) === true;
+        chatState.set(chatId, true);
+        sendCommandResponse(chatId, wasAlreadyActive ? 'Hermes ya esta activo' : 'Hermes chat iniciado');
+        continue;
+      }
+      if (trimmed === '/stop') {
+        const wasAlreadyPaused = chatState.get(chatId) !== true;
+        chatState.set(chatId, false);
+        sendCommandResponse(chatId, wasAlreadyPaused ? 'Hermes ya esta pausado' : 'Hermes chat pausado');
+        continue;
+      }
+
+      // Skip messages from inactive chats (must /start first)
+      if (chatState.get(chatId) !== true) {
+        continue;
+      }
 
       const event = {
         messageId: msg.key.id,

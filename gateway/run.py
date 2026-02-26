@@ -774,20 +774,21 @@ class GatewayRunner:
             )
         
         # One-time prompt if no home channel is set for this platform
-        if not history and source.platform and source.platform != Platform.LOCAL:
-            platform_name = source.platform.value
-            env_key = f"{platform_name.upper()}_HOME_CHANNEL"
-            if not os.getenv(env_key):
-                adapter = self.adapters.get(source.platform)
-                if adapter:
-                    await adapter.send(
-                        source.chat_id,
-                        f"📬 No home channel is set for {platform_name.title()}. "
-                        f"A home channel is where Hermes delivers cron job results "
-                        f"and cross-platform messages.\n\n"
-                        f"Type /sethome to make this chat your home channel, "
-                        f"or ignore to skip."
-                    )
+        # (disabled — too noisy for multi-user WhatsApp setups)
+        # if not history and source.platform and source.platform != Platform.LOCAL:
+        #     platform_name = source.platform.value
+        #     env_key = f"{platform_name.upper()}_HOME_CHANNEL"
+        #     if not os.getenv(env_key):
+        #         adapter = self.adapters.get(source.platform)
+        #         if adapter:
+        #             await adapter.send(
+        #                 source.chat_id,
+        #                 f"📬 No home channel is set for {platform_name.title()}. "
+        #                 f"A home channel is where Hermes delivers cron job results "
+        #                 f"and cross-platform messages.\n\n"
+        #                 f"Type /sethome to make this chat your home channel, "
+        #                 f"or ignore to skip."
+        #             )
         
         # -----------------------------------------------------------------
         # Auto-analyze images sent by the user
