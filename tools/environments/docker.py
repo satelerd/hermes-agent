@@ -139,9 +139,20 @@ class DockerEnvironment(BaseEnvironment):
         all_run_args = list(_SECURITY_ARGS) + writable_args + resource_args + volume_args
         logger.info(f"Docker run_args: {all_run_args}")
 
+        # Forward useful API keys and env vars into the container so tools
+        # (curl, python scripts, etc.) can use them.
+        _forward_keys = [
+            "VOICE_TOOLS_OPENAI_KEY",
+            "OPENAI_API_KEY",
+            "ELEVENLABS_API_KEY",
+            "OPENROUTER_API_KEY",
+            "ANTHROPIC_API_KEY",
+        ]
+
         self._inner = _Docker(
             image=image, cwd=cwd, timeout=timeout,
             run_args=all_run_args,
+            forward_env=_forward_keys,
         )
         self._container_id = self._inner.container_id
 
