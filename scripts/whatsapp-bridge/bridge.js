@@ -8,20 +8,23 @@
  * Endpoints (matches gateway/platforms/whatsapp.py expectations):
  *   GET  /messages       - Long-poll for new incoming messages
  *   POST /send           - Send a message { chatId, message, replyTo? }
+ *   POST /send-audio     - Send audio as voice message (PTT) { chatId, audioPath }
  *   POST /typing         - Send typing indicator { chatId }
  *   GET  /chat/:id       - Get chat info
+ *   GET  /media/:filename - Serve cached media files
  *   GET  /health         - Health check
  *
  * Usage:
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync } from 'fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import { randomBytes } from 'crypto';
 import qrcode from 'qrcode-terminal';
 
 // Parse CLI args
@@ -37,6 +40,10 @@ const PAIR_ONLY = args.includes('--pair-only');
 const ALLOWED_USERS = (process.env.WHATSAPP_ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 mkdirSync(SESSION_DIR, { recursive: true });
+
+// Media cache directory for downloaded audio/images
+const MEDIA_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'media_cache');
+mkdirSync(MEDIA_CACHE_DIR, { recursive: true });
 
 const logger = pino({ level: 'warn' });
 
@@ -112,7 +119,7 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.upsert', ({ messages, type }) => {
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
@@ -168,6 +175,17 @@ async function startSocket() {
       } else if (msg.message.audioMessage || msg.message.pttMessage) {
         hasMedia = true;
         mediaType = msg.message.pttMessage ? 'ptt' : 'audio';
+        // Download audio to local cache so gateway can transcribe it
+        try {
+          const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const filename = `audio_${randomBytes(6).toString('hex')}.ogg`;
+          const filepath = path.join(MEDIA_CACHE_DIR, filename);
+          writeFileSync(filepath, buffer);
+          mediaUrls.push(`http://localhost:${PORT}/media/${filename}`);
+          console.log(`🎤 Cached voice message: ${filename} (${buffer.length} bytes)`);
+        } catch (dlErr) {
+          console.error('Failed to download audio:', dlErr.message);
+        }
       } else if (msg.message.documentMessage) {
         body = msg.message.documentMessage.caption || msg.message.documentMessage.fileName || '';
         hasMedia = true;
@@ -190,6 +208,15 @@ async function startSocket() {
         chatState.set(chatId, false);
         sendCommandResponse(chatId, wasAlreadyPaused ? 'Hermes ya esta pausado' : 'Hermes chat pausado');
         continue;
+      }
+
+      // Self-chat is active by default (no /start needed)
+      if (!chatState.has(chatId)) {
+        const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+        const chatNumber = chatId.replace(/@.*/, '');
+        if (myNumber && chatNumber === myNumber) {
+          chatState.set(chatId, true);
+        }
       }
 
       // Skip messages from inactive chats (must /start first)
@@ -249,6 +276,49 @@ app.post('/send', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Send audio as voice message (PTT)
+app.post('/send-audio', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, audioPath } = req.body;
+  if (!chatId || !audioPath) {
+    return res.status(400).json({ error: 'chatId and audioPath are required' });
+  }
+
+  try {
+    if (!existsSync(audioPath)) {
+      return res.status(404).json({ error: `Audio file not found: ${audioPath}` });
+    }
+    const audioBuffer = readFileSync(audioPath);
+    const ext = audioPath.toLowerCase().split('.').pop();
+    // WhatsApp PTT requires audio/ogg codecs=opus. If the file is MP3,
+    // we still send it but Android may not play it as a voice bubble.
+    const mimetype = (ext === 'ogg' || ext === 'opus')
+      ? 'audio/ogg; codecs=opus'
+      : 'audio/mpeg';
+    const sent = await sock.sendMessage(chatId, {
+      audio: audioBuffer,
+      mimetype,
+      ptt: ext === 'ogg' || ext === 'opus',  // Only PTT for opus-compatible formats
+    });
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Serve cached media files
+app.get('/media/:filename', (req, res) => {
+  const filename = path.basename(req.params.filename); // prevent path traversal
+  const filepath = path.join(MEDIA_CACHE_DIR, filename);
+  if (!existsSync(filepath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  res.sendFile(filepath);
 });
 
 // Typing indicator
