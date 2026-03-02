@@ -262,11 +262,9 @@ async function startSocket() {
 
       // Skip messages from inactive chats (must /start first)
       if (chatState.get(chatId) !== true) {
-        // Send a one-time hint (only once per chat per session to avoid spam)
         if (!chatState.has(chatId)) {
           chatState.set(chatId, false);  // Mark as seen-but-inactive
           saveChatState();
-          sendCommandResponse(chatId, 'Envía */start* para activar Hermes en este chat.');
         }
         continue;
       }
