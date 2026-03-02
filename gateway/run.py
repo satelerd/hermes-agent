@@ -1397,13 +1397,54 @@ class GatewayRunner:
             )
         return "No usage data available for this session."
 
+    def _is_owner(self, source) -> bool:
+        """Check if the message source is the owner based on config.yaml owner_whatsapp."""
+        try:
+            config_path = _hermes_home / 'config.yaml'
+            if not config_path.exists():
+                return False
+            import yaml
+            with open(config_path, 'r') as f:
+                cfg = yaml.safe_load(f) or {}
+            owner_number = cfg.get("owner_whatsapp", "")
+            if not owner_number:
+                return False
+            user_id = (source.user_id or "").replace("+", "").replace("@s.whatsapp.net", "")
+            owner_clean = owner_number.replace("+", "")
+            return user_id == owner_clean or owner_clean in user_id
+        except Exception:
+            return False
+
     def _set_session_env(self, context: SessionContext) -> None:
-        """Set environment variables for the current session."""
+        """Set environment variables for the current session.
+
+        Dual-mode: if the message is from the owner (matched by owner_whatsapp
+        in config.yaml), use TERMINAL_ENV=local for full system access.
+        Otherwise, use the configured default (e.g. docker for sandboxing).
+        """
         os.environ["HERMES_SESSION_PLATFORM"] = context.source.platform.value
         os.environ["HERMES_SESSION_CHAT_ID"] = context.source.chat_id
         if context.source.chat_name:
             os.environ["HERMES_SESSION_CHAT_NAME"] = context.source.chat_name
-    
+
+        # Dual-mode terminal environment
+        if self._is_owner(context.source):
+            os.environ["TERMINAL_ENV"] = "local"
+        else:
+            # Read default backend from config.yaml terminal.backend
+            try:
+                import yaml
+                config_path = _hermes_home / 'config.yaml'
+                if config_path.exists():
+                    with open(config_path, 'r') as f:
+                        cfg = yaml.safe_load(f) or {}
+                    terminal_cfg = cfg.get("terminal", {})
+                    if isinstance(terminal_cfg, dict):
+                        backend = terminal_cfg.get("backend", "local")
+                        os.environ["TERMINAL_ENV"] = str(backend)
+            except Exception:
+                pass  # Keep whatever TERMINAL_ENV was set before
+
     def _clear_session_env(self) -> None:
         """Clear session environment variables."""
         for var in ["HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME"]:
@@ -1666,7 +1707,11 @@ class GatewayRunner:
         else:
             default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
             enabled_toolsets = [default_toolset]
-        
+
+        # Dual-mode: non-owner WhatsApp users get sandboxed toolset
+        if source.platform == Platform.WHATSAPP and not self._is_owner(source):
+            enabled_toolsets = ["hermes-whatsapp-sandboxed"]
+
         # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
         # Falls back to env vars for backward compatibility
         _progress_cfg = {}

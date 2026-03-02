@@ -240,6 +240,20 @@ TOOLSETS = {
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
+
+    "hermes-whatsapp-sandboxed": {
+        "description": "Sandboxed WhatsApp toolset for non-owner users (no terminal, no file writes)",
+        "tools": [
+            "web_search", "web_extract",
+            "read_file", "search_files",
+            "vision_analyze", "image_generate",
+            "text_to_speech",
+            "todo", "memory",
+            "clarify",
+            "execute_code",
+        ],
+        "includes": []
+    },
     
     "hermes-slack": {
         "description": "Slack bot toolset - full access for workspace use (terminal has safety checks)",

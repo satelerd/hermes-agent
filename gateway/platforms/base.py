@@ -682,7 +682,6 @@ class BasePlatformAdapter(ABC):
                 for audio_path, is_voice in media_files:
                     # Skip files that were already delivered in a previous turn
                     if audio_path in self._delivered_media:
-                        print(f"[{self.name}] Skipping already-delivered audio: {audio_path}")
                         continue
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
