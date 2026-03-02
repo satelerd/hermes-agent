@@ -833,6 +833,11 @@ class GatewayRunner:
                 if is_audio:
                     audio_paths.append(path)
             if audio_paths:
+                # Ensure API keys are loaded from .env before transcription
+                try:
+                    load_dotenv(_env_path, override=True, encoding="utf-8")
+                except Exception:
+                    pass
                 message_text = await self._enrich_message_with_transcription(
                     message_text, audio_paths
                 )
@@ -942,6 +947,15 @@ class GatewayRunner:
             history_len = len(history)
             new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else agent_messages
             
+            # Strip MEDIA:<path> and [[audio_as_voice]] tags before persisting
+            # to the transcript.  These are delivery directives consumed by the
+            # adapter's extract_media(); leaving them in history causes the audio
+            # to be re-sent on the next turn.
+            _media_tag_re = re.compile(r'\[\[audio_as_voice\]\]\n?|MEDIA:\S+\n?')
+            def _strip_media(text: str) -> str:
+                cleaned = _media_tag_re.sub('', text)
+                return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
             # If no new messages found (edge case), fall back to simple user/assistant
             if not new_messages:
                 self.session_store.append_to_transcript(
@@ -951,15 +965,18 @@ class GatewayRunner:
                 if response:
                     self.session_store.append_to_transcript(
                         session_entry.session_id,
-                        {"role": "assistant", "content": response, "timestamp": ts}
+                        {"role": "assistant", "content": _strip_media(response), "timestamp": ts}
                     )
             else:
                 for msg in new_messages:
                     # Skip system messages (they're rebuilt each run)
                     if msg.get("role") == "system":
                         continue
-                    # Add timestamp to each message for debugging
+                    # Strip MEDIA tags from tool results and assistant messages
                     entry = {**msg, "timestamp": ts}
+                    content = entry.get("content", "")
+                    if content and ("MEDIA:" in content or "[[audio_as_voice]]" in content):
+                        entry["content"] = _strip_media(content)
                     self.session_store.append_to_transcript(
                         session_entry.session_id, entry
                     )
@@ -1948,6 +1965,7 @@ class GatewayRunner:
             # Uses path-based deduplication against _history_media_paths (collected
             # before run_conversation) instead of index slicing. This is safe even
             # when context compression shrinks the message list. (Fixes #160)
+            # The adapter's _delivered_media set provides additional safety.
             if "MEDIA:" not in final_response:
                 media_tags = []
                 has_voice_directive = False
@@ -1961,7 +1979,7 @@ class GatewayRunner:
                                     media_tags.append(f"MEDIA:{path}")
                             if "[[audio_as_voice]]" in content:
                                 has_voice_directive = True
-                
+
                 if media_tags:
                     seen = set()
                     unique_tags = []

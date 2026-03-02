@@ -343,6 +343,8 @@ class BasePlatformAdapter(ABC):
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        # Track already-delivered media files to prevent re-sending on subsequent turns
+        self._delivered_media: set = set()
     
     @property
     def name(self) -> str:
@@ -678,6 +680,10 @@ class BasePlatformAdapter(ABC):
                 
                 # Send extracted audio/voice files as native attachments
                 for audio_path, is_voice in media_files:
+                    # Skip files that were already delivered in a previous turn
+                    if audio_path in self._delivered_media:
+                        print(f"[{self.name}] Skipping already-delivered audio: {audio_path}")
+                        continue
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
@@ -687,6 +693,8 @@ class BasePlatformAdapter(ABC):
                         )
                         if not voice_result.success:
                             print(f"[{self.name}] Failed to send voice: {voice_result.error}")
+                        else:
+                            self._delivered_media.add(audio_path)
                     except Exception as voice_err:
                         print(f"[{self.name}] Error sending voice: {voice_err}")
             
