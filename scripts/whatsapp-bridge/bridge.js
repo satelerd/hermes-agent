@@ -157,13 +157,18 @@ async function startSocket() {
       const senderNumber = senderId.replace(/@.*/, '');
 
       // For own messages: allow /start, /stop, /continue commands in ANY chat,
+      // allow *-prefixed messages as owner override in any active chat,
       // but only queue regular messages from self-chat ("Message Yourself").
+      let ownerOverride = false;
       if (msg.key.fromMe) {
-        // Quick-extract text to check for commands
-        const quickBody = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim().toLowerCase();
-        const isCommand = quickBody === '/start' || quickBody === '/continue' || quickBody === '/stop';
+        // Quick-extract text to check for commands and owner override
+        const quickBody = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
+        const quickLower = quickBody.toLowerCase();
+        const isCommand = quickLower === '/start' || quickLower === '/continue' || quickLower === '/stop';
+        // Owner override: message starts with * — forward to agent in any active chat
+        const isOverride = quickBody.startsWith('*') && quickBody.length > 1;
 
-        if (!isCommand) {
+        if (!isCommand && !isOverride) {
           // Regular message: skip in groups and status
           if (isGroup || chatId.includes('status')) continue;
           // In DMs: only allow self-chat
@@ -172,7 +177,8 @@ async function startSocket() {
           const isSelfChat = myNumber && chatNumber === myNumber;
           if (!isSelfChat) continue;
         }
-        // Commands from owner fall through to be handled below
+        if (isOverride) ownerOverride = true;
+        // Commands and overrides from owner fall through to be handled below
       }
 
       // Check allowlist for messages from others
@@ -220,6 +226,12 @@ async function startSocket() {
 
       // Skip empty messages
       if (!body && !hasMedia) continue;
+
+      // Owner override: strip leading * from body
+      if (ownerOverride && body.startsWith('*')) {
+        body = body.slice(1).trimStart();
+        if (!body && !hasMedia) continue; // Nothing left after stripping
+      }
 
       // Handle /start, /continue, /stop commands (case-insensitive)
       const trimmed = body.trim().toLowerCase();
