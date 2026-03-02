@@ -236,6 +236,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         self._bridge_process = None
         print(f"[{self.name}] Disconnected")
     
+    MAX_SEND_CHUNKS = 3  # Safety limit: never send more than 3 chunks per response
+
     async def send(
         self,
         chat_id: str,
@@ -243,13 +245,41 @@ class WhatsAppAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
-        """Send a message via the WhatsApp bridge."""
+        """Send a message via the WhatsApp bridge, splitting if needed."""
         if not self._running:
             return SendResult(success=False, error="Not connected")
-        
+
+        # Split long messages into chunks (like Discord/Telegram)
+        chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
+
+        # Safety: cap the number of chunks to prevent flooding
+        if len(chunks) > self.MAX_SEND_CHUNKS:
+            chunks = chunks[:self.MAX_SEND_CHUNKS]
+            chunks[-1] += "\n\n_(Response truncated)_"
+
+        last_result = SendResult(success=False, error="No chunks to send")
+        for i, chunk in enumerate(chunks):
+            result = await self._send_single(chat_id, chunk, reply_to if i == 0 else None)
+            last_result = result
+            if not result.success:
+                return result
+            # Small delay between chunks to avoid flooding
+            if i < len(chunks) - 1:
+                import asyncio
+                await asyncio.sleep(1.0)
+
+        return last_result
+
+    async def _send_single(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Send a single message to the WhatsApp bridge."""
         try:
             import aiohttp
-            
+
             async with aiohttp.ClientSession() as session:
                 payload = {
                     "chatId": chat_id,
@@ -257,7 +287,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 }
                 if reply_to:
                     payload["replyTo"] = reply_to
-                
+
                 async with session.post(
                     f"http://localhost:{self._bridge_port}/send",
                     json=payload,
@@ -273,15 +303,82 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     else:
                         error = await resp.text()
                         return SendResult(success=False, error=error)
-                        
+
         except ImportError:
             return SendResult(
-                success=False, 
+                success=False,
                 error="aiohttp not installed. Run: pip install aiohttp"
             )
         except Exception as e:
             return SendResult(success=False, error=str(e))
     
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+    ) -> SendResult:
+        """Edit a previously sent message via the WhatsApp bridge."""
+        if not self._running:
+            return SendResult(success=False, error="Not connected")
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://localhost:{self._bridge_port}/edit",
+                    json={
+                        "chatId": chat_id,
+                        "messageId": message_id,
+                        "message": content,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status == 200:
+                        return SendResult(success=True, message_id=message_id)
+                    else:
+                        error = await resp.text()
+                        return SendResult(success=False, error=error)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Send audio as a native WhatsApp voice message (PTT) via bridge."""
+        if not self._running:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            import aiohttp
+            import os
+
+            if not os.path.exists(audio_path):
+                return SendResult(success=False, error=f"Audio file not found: {audio_path}")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://localhost:{self._bridge_port}/send-audio",
+                    json={"chatId": chat_id, "audioPath": audio_path},
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return SendResult(
+                            success=True,
+                            message_id=data.get("messageId"),
+                            raw_response=data
+                        )
+                    else:
+                        error = await resp.text()
+                        return SendResult(success=False, error=error)
+
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
     async def send_typing(self, chat_id: str) -> None:
         """Send typing indicator via bridge."""
         if not self._running:

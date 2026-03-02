@@ -8,20 +8,24 @@
  * Endpoints (matches gateway/platforms/whatsapp.py expectations):
  *   GET  /messages       - Long-poll for new incoming messages
  *   POST /send           - Send a message { chatId, message, replyTo? }
+ *   POST /edit           - Edit a sent message { chatId, messageId, message }
+ *   POST /send-audio     - Send audio as voice message (PTT) { chatId, audioPath }
  *   POST /typing         - Send typing indicator { chatId }
  *   GET  /chat/:id       - Get chat info
+ *   GET  /media/:filename - Serve cached media files
  *   GET  /health         - Health check
  *
  * Usage:
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
  */
 
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
 import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync } from 'fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import { randomBytes } from 'crypto';
 import qrcode from 'qrcode-terminal';
 
 // Parse CLI args
@@ -38,6 +42,10 @@ const ALLOWED_USERS = (process.env.WHATSAPP_ALLOWED_USERS || '').split(',').map(
 
 mkdirSync(SESSION_DIR, { recursive: true });
 
+// Media cache directory for downloaded audio/images
+const MEDIA_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'media_cache');
+mkdirSync(MEDIA_CACHE_DIR, { recursive: true });
+
 const logger = pino({ level: 'warn' });
 
 // Message queue for polling
@@ -46,6 +54,44 @@ const MAX_QUEUE_SIZE = 100;
 
 let sock = null;
 let connectionState = 'disconnected';
+
+// Per-chat active/paused state (true = active, false = paused)
+// Default: paused (not in map means paused — user must /start first)
+// Persisted to disk so state survives restarts.
+const CHAT_STATE_FILE = path.join(SESSION_DIR, 'chat_state.json');
+const chatState = new Map();
+
+function loadChatState() {
+  try {
+    if (existsSync(CHAT_STATE_FILE)) {
+      const data = JSON.parse(readFileSync(CHAT_STATE_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(data)) chatState.set(k, v);
+      console.log(`📋 Loaded chat state: ${chatState.size} chats`);
+    }
+  } catch (err) {
+    console.error('Failed to load chat state:', err.message);
+  }
+}
+
+function saveChatState() {
+  try {
+    const obj = Object.fromEntries(chatState);
+    writeFileSync(CHAT_STATE_FILE, JSON.stringify(obj, null, 2));
+  } catch (err) {
+    console.error('Failed to save chat state:', err.message);
+  }
+}
+
+loadChatState();
+
+async function sendCommandResponse(chatId, text) {
+  if (!sock || connectionState !== 'connected') return;
+  try {
+    await sock.sendMessage(chatId, { text: `⚕ *Hermes Agent*\n────────────\n${text}` });
+  } catch (err) {
+    console.error('Failed to send command response:', err.message);
+  }
+}
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -99,7 +145,7 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.upsert', ({ messages, type }) => {
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
@@ -110,15 +156,23 @@ async function startSocket() {
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
 
-      // Skip own messages UNLESS it's a self-chat ("Message Yourself")
+      // For own messages: allow /start, /stop, /continue commands in ANY chat,
+      // but only queue regular messages from self-chat ("Message Yourself").
       if (msg.key.fromMe) {
-        // Always skip in groups and status
-        if (isGroup || chatId.includes('status')) continue;
-        // In DMs: only allow self-chat (remoteJid matches our own number)
-        const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const chatNumber = chatId.replace(/@.*/, '');
-        const isSelfChat = myNumber && chatNumber === myNumber;
-        if (!isSelfChat) continue;
+        // Quick-extract text to check for commands
+        const quickBody = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim().toLowerCase();
+        const isCommand = quickBody === '/start' || quickBody === '/continue' || quickBody === '/stop';
+
+        if (!isCommand) {
+          // Regular message: skip in groups and status
+          if (isGroup || chatId.includes('status')) continue;
+          // In DMs: only allow self-chat
+          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+          const chatNumber = chatId.replace(/@.*/, '');
+          const isSelfChat = myNumber && chatNumber === myNumber;
+          if (!isSelfChat) continue;
+        }
+        // Commands from owner fall through to be handled below
       }
 
       // Check allowlist for messages from others
@@ -147,6 +201,17 @@ async function startSocket() {
       } else if (msg.message.audioMessage || msg.message.pttMessage) {
         hasMedia = true;
         mediaType = msg.message.pttMessage ? 'ptt' : 'audio';
+        // Download audio to local cache so gateway can transcribe it
+        try {
+          const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const filename = `audio_${randomBytes(6).toString('hex')}.ogg`;
+          const filepath = path.join(MEDIA_CACHE_DIR, filename);
+          writeFileSync(filepath, buffer);
+          mediaUrls.push(`http://localhost:${PORT}/media/${filename}`);
+          console.log(`🎤 Cached voice message: ${filename} (${buffer.length} bytes)`);
+        } catch (dlErr) {
+          console.error('Failed to download audio:', dlErr.message);
+        }
       } else if (msg.message.documentMessage) {
         body = msg.message.documentMessage.caption || msg.message.documentMessage.fileName || '';
         hasMedia = true;
@@ -155,6 +220,44 @@ async function startSocket() {
 
       // Skip empty messages
       if (!body && !hasMedia) continue;
+
+      // Handle /start, /continue, /stop commands (case-insensitive)
+      const trimmed = body.trim().toLowerCase();
+      if (trimmed === '/start' || trimmed === '/continue') {
+        const wasAlreadyActive = chatState.get(chatId) === true;
+        chatState.set(chatId, true);
+        saveChatState();
+        sendCommandResponse(chatId, wasAlreadyActive ? 'Hermes ya esta activo' : 'Hermes chat iniciado');
+        continue;
+      }
+      if (trimmed === '/stop') {
+        const wasAlreadyPaused = chatState.get(chatId) !== true;
+        chatState.set(chatId, false);
+        saveChatState();
+        sendCommandResponse(chatId, wasAlreadyPaused ? 'Hermes ya esta pausado' : 'Hermes chat pausado');
+        continue;
+      }
+
+      // Self-chat is active by default (no /start needed)
+      if (!chatState.has(chatId)) {
+        const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+        const chatNumber = chatId.replace(/@.*/, '');
+        if (myNumber && chatNumber === myNumber) {
+          chatState.set(chatId, true);
+          saveChatState();
+        }
+      }
+
+      // Skip messages from inactive chats (must /start first)
+      if (chatState.get(chatId) !== true) {
+        // Send a one-time hint (only once per chat per session to avoid spam)
+        if (!chatState.has(chatId)) {
+          chatState.set(chatId, false);  // Mark as seen-but-inactive
+          saveChatState();
+          sendCommandResponse(chatId, 'Envía */start* para activar Hermes en este chat.');
+        }
+        continue;
+      }
 
       const event = {
         messageId: msg.key.id,
@@ -208,6 +311,70 @@ app.post('/send', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Edit a previously sent message
+app.post('/edit', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, messageId, message } = req.body;
+  if (!chatId || !messageId || !message) {
+    return res.status(400).json({ error: 'chatId, messageId, and message are required' });
+  }
+
+  try {
+    const prefixed = `⚕ *Hermes Agent*\n────────────\n${message}`;
+    const key = { id: messageId, fromMe: true, remoteJid: chatId };
+    await sock.sendMessage(chatId, { text: prefixed, edit: key });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send audio as voice message (PTT)
+app.post('/send-audio', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, audioPath } = req.body;
+  if (!chatId || !audioPath) {
+    return res.status(400).json({ error: 'chatId and audioPath are required' });
+  }
+
+  try {
+    if (!existsSync(audioPath)) {
+      return res.status(404).json({ error: `Audio file not found: ${audioPath}` });
+    }
+    const audioBuffer = readFileSync(audioPath);
+    const ext = audioPath.toLowerCase().split('.').pop();
+    // WhatsApp PTT requires audio/ogg codecs=opus. If the file is MP3,
+    // we still send it but Android may not play it as a voice bubble.
+    const mimetype = (ext === 'ogg' || ext === 'opus')
+      ? 'audio/ogg; codecs=opus'
+      : 'audio/mpeg';
+    const sent = await sock.sendMessage(chatId, {
+      audio: audioBuffer,
+      mimetype,
+      ptt: ext === 'ogg' || ext === 'opus',  // Only PTT for opus-compatible formats
+    });
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Serve cached media files
+app.get('/media/:filename', (req, res) => {
+  const filename = path.basename(req.params.filename); // prevent path traversal
+  const filepath = path.join(MEDIA_CACHE_DIR, filename);
+  if (!existsSync(filepath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  res.sendFile(filepath);
 });
 
 // Typing indicator

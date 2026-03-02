@@ -343,6 +343,8 @@ class BasePlatformAdapter(ABC):
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        # Track already-delivered media files to prevent re-sending on subsequent turns
+        self._delivered_media: set = set()
     
     @property
     def name(self) -> str:
@@ -398,7 +400,20 @@ class BasePlatformAdapter(ABC):
             SendResult with success status and message ID
         """
         pass
-    
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+    ) -> SendResult:
+        """
+        Edit a previously sent message. Optional — platforms that don't
+        support editing return success=False and callers fall back to
+        sending a new message.
+        """
+        return SendResult(success=False, error="Not supported")
+
     async def send_typing(self, chat_id: str) -> None:
         """
         Send a typing indicator.
@@ -678,6 +693,9 @@ class BasePlatformAdapter(ABC):
                 
                 # Send extracted audio/voice files as native attachments
                 for audio_path, is_voice in media_files:
+                    # Skip files that were already delivered in a previous turn
+                    if audio_path in self._delivered_media:
+                        continue
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
@@ -687,6 +705,8 @@ class BasePlatformAdapter(ABC):
                         )
                         if not voice_result.success:
                             print(f"[{self.name}] Failed to send voice: {voice_result.error}")
+                        else:
+                            self._delivered_media.add(audio_path)
                     except Exception as voice_err:
                         print(f"[{self.name}] Error sending voice: {voice_err}")
             

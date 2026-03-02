@@ -56,10 +56,12 @@ if _config_path.exists():
                 os.environ[_key] = str(_val)
         # Terminal config is nested — bridge to TERMINAL_* env vars.
         # config.yaml overrides .env for these since it's the documented config path.
+        # NOTE: "backend" (TERMINAL_ENV) is excluded here — it's managed per-session
+        # by _set_session_env() for dual-mode (owner=local, others=docker).
         _terminal_cfg = _cfg.get("terminal", {})
         if _terminal_cfg and isinstance(_terminal_cfg, dict):
             _terminal_env_map = {
-                "backend": "TERMINAL_ENV",
+                # "backend" intentionally omitted — set per-session by _set_session_env()
                 "cwd": "TERMINAL_CWD",
                 "timeout": "TERMINAL_TIMEOUT",
                 "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
@@ -774,20 +776,21 @@ class GatewayRunner:
             )
         
         # One-time prompt if no home channel is set for this platform
-        if not history and source.platform and source.platform != Platform.LOCAL:
-            platform_name = source.platform.value
-            env_key = f"{platform_name.upper()}_HOME_CHANNEL"
-            if not os.getenv(env_key):
-                adapter = self.adapters.get(source.platform)
-                if adapter:
-                    await adapter.send(
-                        source.chat_id,
-                        f"📬 No home channel is set for {platform_name.title()}. "
-                        f"A home channel is where Hermes delivers cron job results "
-                        f"and cross-platform messages.\n\n"
-                        f"Type /sethome to make this chat your home channel, "
-                        f"or ignore to skip."
-                    )
+        # (disabled — too noisy for multi-user WhatsApp setups)
+        # if not history and source.platform and source.platform != Platform.LOCAL:
+        #     platform_name = source.platform.value
+        #     env_key = f"{platform_name.upper()}_HOME_CHANNEL"
+        #     if not os.getenv(env_key):
+        #         adapter = self.adapters.get(source.platform)
+        #         if adapter:
+        #             await adapter.send(
+        #                 source.chat_id,
+        #                 f"📬 No home channel is set for {platform_name.title()}. "
+        #                 f"A home channel is where Hermes delivers cron job results "
+        #                 f"and cross-platform messages.\n\n"
+        #                 f"Type /sethome to make this chat your home channel, "
+        #                 f"or ignore to skip."
+        #             )
         
         # -----------------------------------------------------------------
         # Auto-analyze images sent by the user
@@ -832,6 +835,11 @@ class GatewayRunner:
                 if is_audio:
                     audio_paths.append(path)
             if audio_paths:
+                # Ensure API keys are loaded from .env before transcription
+                try:
+                    load_dotenv(_env_path, override=True, encoding="utf-8")
+                except Exception:
+                    pass
                 message_text = await self._enrich_message_with_transcription(
                     message_text, audio_paths
                 )
@@ -941,6 +949,15 @@ class GatewayRunner:
             history_len = len(history)
             new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else agent_messages
             
+            # Strip MEDIA:<path> and [[audio_as_voice]] tags before persisting
+            # to the transcript.  These are delivery directives consumed by the
+            # adapter's extract_media(); leaving them in history causes the audio
+            # to be re-sent on the next turn.
+            _media_tag_re = re.compile(r'\[\[audio_as_voice\]\]\n?|MEDIA:\S+\n?')
+            def _strip_media(text: str) -> str:
+                cleaned = _media_tag_re.sub('', text)
+                return re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+
             # If no new messages found (edge case), fall back to simple user/assistant
             if not new_messages:
                 self.session_store.append_to_transcript(
@@ -950,15 +967,18 @@ class GatewayRunner:
                 if response:
                     self.session_store.append_to_transcript(
                         session_entry.session_id,
-                        {"role": "assistant", "content": response, "timestamp": ts}
+                        {"role": "assistant", "content": _strip_media(response), "timestamp": ts}
                     )
             else:
                 for msg in new_messages:
                     # Skip system messages (they're rebuilt each run)
                     if msg.get("role") == "system":
                         continue
-                    # Add timestamp to each message for debugging
+                    # Strip MEDIA tags from tool results and assistant messages
                     entry = {**msg, "timestamp": ts}
+                    content = entry.get("content", "")
+                    if content and ("MEDIA:" in content or "[[audio_as_voice]]" in content):
+                        entry["content"] = _strip_media(content)
                     self.session_store.append_to_transcript(
                         session_entry.session_id, entry
                     )
@@ -1379,13 +1399,56 @@ class GatewayRunner:
             )
         return "No usage data available for this session."
 
+    def _is_owner(self, source) -> bool:
+        """Check if the message source is the owner based on config.yaml owner_whatsapp."""
+        try:
+            config_path = _hermes_home / 'config.yaml'
+            if not config_path.exists():
+                return False
+            import yaml
+            with open(config_path, 'r') as f:
+                cfg = yaml.safe_load(f) or {}
+            owner_number = cfg.get("owner_whatsapp", "")
+            if not owner_number:
+                return False
+            user_id = (source.user_id or "").replace("+", "").replace("@s.whatsapp.net", "")
+            owner_clean = owner_number.replace("+", "")
+            is_owner = user_id == owner_clean or owner_clean in user_id
+            logger.debug("_is_owner check: user_id=%r owner=%r match=%s", user_id, owner_clean, is_owner)
+            return is_owner
+        except Exception:
+            return False
+
     def _set_session_env(self, context: SessionContext) -> None:
-        """Set environment variables for the current session."""
+        """Set environment variables for the current session.
+
+        Dual-mode: if the message is from the owner (matched by owner_whatsapp
+        in config.yaml), use TERMINAL_ENV=local for full system access.
+        Otherwise, use the configured default (e.g. docker for sandboxing).
+        """
         os.environ["HERMES_SESSION_PLATFORM"] = context.source.platform.value
         os.environ["HERMES_SESSION_CHAT_ID"] = context.source.chat_id
         if context.source.chat_name:
             os.environ["HERMES_SESSION_CHAT_NAME"] = context.source.chat_name
-    
+
+        # Dual-mode terminal environment
+        if self._is_owner(context.source):
+            os.environ["TERMINAL_ENV"] = "local"
+        else:
+            # Read default backend from config.yaml terminal.backend
+            try:
+                import yaml
+                config_path = _hermes_home / 'config.yaml'
+                if config_path.exists():
+                    with open(config_path, 'r') as f:
+                        cfg = yaml.safe_load(f) or {}
+                    terminal_cfg = cfg.get("terminal", {})
+                    if isinstance(terminal_cfg, dict):
+                        backend = terminal_cfg.get("backend", "local")
+                        os.environ["TERMINAL_ENV"] = str(backend)
+            except Exception:
+                pass  # Keep whatever TERMINAL_ENV was set before
+
     def _clear_session_env(self) -> None:
         """Clear session environment variables."""
         for var in ["HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME"]:
@@ -1648,7 +1711,11 @@ class GatewayRunner:
         else:
             default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
             enabled_toolsets = [default_toolset]
-        
+
+        # Dual-mode: non-owner WhatsApp users get sandboxed toolset
+        if source.platform == Platform.WHATSAPP and not self._is_owner(source):
+            enabled_toolsets = ["hermes-whatsapp-sandboxed"]
+
         # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
         # Falls back to env vars for backward compatibility
         _progress_cfg = {}
@@ -1746,32 +1813,67 @@ class GatewayRunner:
             progress_queue.put(msg)
         
         # Background task to send progress messages
+        # Accumulates tool lines into a single message that gets edited
         async def send_progress_messages():
             if not progress_queue:
                 return
-            
+
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return
-            
+
+            progress_lines = []      # Accumulated tool lines
+            progress_msg_id = None   # ID of the progress message to edit
+
             while True:
                 try:
-                    # Non-blocking check with small timeout
                     msg = progress_queue.get_nowait()
-                    await adapter.send(chat_id=source.chat_id, content=msg)
-                    # Restore typing indicator after sending progress message
+                    progress_lines.append(msg)
+                    full_text = "\n".join(progress_lines)
+
+                    if progress_msg_id is None:
+                        # First tool: send as new message
+                        result = await adapter.send(chat_id=source.chat_id, content=full_text)
+                        if result.success and result.message_id:
+                            progress_msg_id = result.message_id
+                    else:
+                        # Subsequent tools: try to edit, fall back to new message
+                        result = await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=progress_msg_id,
+                            content=full_text,
+                        )
+                        if not result.success:
+                            # Edit failed — send as new message and track it
+                            result = await adapter.send(chat_id=source.chat_id, content=full_text)
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
+
+                    # Restore typing indicator
                     await asyncio.sleep(0.3)
                     await adapter.send_typing(source.chat_id)
+
                 except queue.Empty:
-                    await asyncio.sleep(0.3)  # Check again soon
+                    await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
-                    # Drain remaining messages
+                    # Drain remaining queued messages
                     while not progress_queue.empty():
                         try:
                             msg = progress_queue.get_nowait()
-                            await adapter.send(chat_id=source.chat_id, content=msg)
+                            progress_lines.append(msg)
                         except Exception:
                             break
+                    # Final edit with all remaining tools
+                    if progress_lines and progress_msg_id:
+                        full_text = "\n".join(progress_lines)
+                        try:
+                            await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=progress_msg_id,
+                                content=full_text,
+                            )
+                        except Exception:
+                            pass
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
@@ -1962,6 +2064,7 @@ class GatewayRunner:
             # Uses path-based deduplication against _history_media_paths (collected
             # before run_conversation) instead of index slicing. This is safe even
             # when context compression shrinks the message list. (Fixes #160)
+            # The adapter's _delivered_media set provides additional safety.
             if "MEDIA:" not in final_response:
                 media_tags = []
                 has_voice_directive = False
@@ -1975,7 +2078,7 @@ class GatewayRunner:
                                     media_tags.append(f"MEDIA:{path}")
                             if "[[audio_as_voice]]" in content:
                                 has_voice_directive = True
-                
+
                 if media_tags:
                     seen = set()
                     unique_tags = []

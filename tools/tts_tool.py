@@ -276,7 +276,7 @@ def text_to_speech_tool(
     # produce Opus natively (no ffmpeg needed).  Edge TTS always outputs MP3
     # and needs ffmpeg for conversion.
     platform = os.getenv("HERMES_SESSION_PLATFORM", "").lower()
-    want_opus = (platform == "telegram")
+    want_opus = platform in ("telegram", "whatsapp")
 
     # Determine output path
     if output_path:
