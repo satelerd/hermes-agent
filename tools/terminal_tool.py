@@ -809,15 +809,35 @@ def terminal_tool(
         # Start cleanup thread
         _start_cleanup_thread()
 
+        # Map env_type to expected class for cache validation
+        _env_type_class = {
+            "local": _LocalEnvironment,
+            "docker": _DockerEnvironment,
+        }
+
         # Get or create environment.
         # Use a per-task creation lock so concurrent tool calls for the same
         # task_id wait for the first one to finish creating the sandbox,
         # instead of each creating their own (wasting Modal resources).
         with _env_lock:
             if effective_task_id in _active_environments:
-                _last_activity[effective_task_id] = time.time()
-                env = _active_environments[effective_task_id]
-                needs_creation = False
+                cached_env = _active_environments[effective_task_id]
+                expected_cls = _env_type_class.get(env_type)
+                if expected_cls and not isinstance(cached_env, expected_cls):
+                    # env_type changed (e.g. docker→local via dual-mode) — evict stale env
+                    logger.info("Evicting cached %s env for task %s (now %s)",
+                                type(cached_env).__name__, effective_task_id[:8], env_type)
+                    try:
+                        cached_env.cleanup()
+                    except Exception:
+                        pass
+                    del _active_environments[effective_task_id]
+                    _last_activity.pop(effective_task_id, None)
+                    needs_creation = True
+                else:
+                    _last_activity[effective_task_id] = time.time()
+                    env = cached_env
+                    needs_creation = False
             else:
                 needs_creation = True
 

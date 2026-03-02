@@ -56,10 +56,12 @@ if _config_path.exists():
                 os.environ[_key] = str(_val)
         # Terminal config is nested — bridge to TERMINAL_* env vars.
         # config.yaml overrides .env for these since it's the documented config path.
+        # NOTE: "backend" (TERMINAL_ENV) is excluded here — it's managed per-session
+        # by _set_session_env() for dual-mode (owner=local, others=docker).
         _terminal_cfg = _cfg.get("terminal", {})
         if _terminal_cfg and isinstance(_terminal_cfg, dict):
             _terminal_env_map = {
-                "backend": "TERMINAL_ENV",
+                # "backend" intentionally omitted — set per-session by _set_session_env()
                 "cwd": "TERMINAL_CWD",
                 "timeout": "TERMINAL_TIMEOUT",
                 "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
@@ -1411,7 +1413,9 @@ class GatewayRunner:
                 return False
             user_id = (source.user_id or "").replace("+", "").replace("@s.whatsapp.net", "")
             owner_clean = owner_number.replace("+", "")
-            return user_id == owner_clean or owner_clean in user_id
+            is_owner = user_id == owner_clean or owner_clean in user_id
+            logger.debug("_is_owner check: user_id=%r owner=%r match=%s", user_id, owner_clean, is_owner)
+            return is_owner
         except Exception:
             return False
 
@@ -1794,32 +1798,67 @@ class GatewayRunner:
             progress_queue.put(msg)
         
         # Background task to send progress messages
+        # Accumulates tool lines into a single message that gets edited
         async def send_progress_messages():
             if not progress_queue:
                 return
-            
+
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return
-            
+
+            progress_lines = []      # Accumulated tool lines
+            progress_msg_id = None   # ID of the progress message to edit
+
             while True:
                 try:
-                    # Non-blocking check with small timeout
                     msg = progress_queue.get_nowait()
-                    await adapter.send(chat_id=source.chat_id, content=msg)
-                    # Restore typing indicator after sending progress message
+                    progress_lines.append(msg)
+                    full_text = "\n".join(progress_lines)
+
+                    if progress_msg_id is None:
+                        # First tool: send as new message
+                        result = await adapter.send(chat_id=source.chat_id, content=full_text)
+                        if result.success and result.message_id:
+                            progress_msg_id = result.message_id
+                    else:
+                        # Subsequent tools: try to edit, fall back to new message
+                        result = await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=progress_msg_id,
+                            content=full_text,
+                        )
+                        if not result.success:
+                            # Edit failed — send as new message and track it
+                            result = await adapter.send(chat_id=source.chat_id, content=full_text)
+                            if result.success and result.message_id:
+                                progress_msg_id = result.message_id
+
+                    # Restore typing indicator
                     await asyncio.sleep(0.3)
                     await adapter.send_typing(source.chat_id)
+
                 except queue.Empty:
-                    await asyncio.sleep(0.3)  # Check again soon
+                    await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
-                    # Drain remaining messages
+                    # Drain remaining queued messages
                     while not progress_queue.empty():
                         try:
                             msg = progress_queue.get_nowait()
-                            await adapter.send(chat_id=source.chat_id, content=msg)
+                            progress_lines.append(msg)
                         except Exception:
                             break
+                    # Final edit with all remaining tools
+                    if progress_lines and progress_msg_id:
+                        full_text = "\n".join(progress_lines)
+                        try:
+                            await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=progress_msg_id,
+                                content=full_text,
+                            )
+                        except Exception:
+                            pass
                     return
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
