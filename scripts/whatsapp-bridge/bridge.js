@@ -57,7 +57,32 @@ let connectionState = 'disconnected';
 
 // Per-chat active/paused state (true = active, false = paused)
 // Default: paused (not in map means paused — user must /start first)
+// Persisted to disk so state survives restarts.
+const CHAT_STATE_FILE = path.join(SESSION_DIR, 'chat_state.json');
 const chatState = new Map();
+
+function loadChatState() {
+  try {
+    if (existsSync(CHAT_STATE_FILE)) {
+      const data = JSON.parse(readFileSync(CHAT_STATE_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(data)) chatState.set(k, v);
+      console.log(`📋 Loaded chat state: ${chatState.size} chats`);
+    }
+  } catch (err) {
+    console.error('Failed to load chat state:', err.message);
+  }
+}
+
+function saveChatState() {
+  try {
+    const obj = Object.fromEntries(chatState);
+    writeFileSync(CHAT_STATE_FILE, JSON.stringify(obj, null, 2));
+  } catch (err) {
+    console.error('Failed to save chat state:', err.message);
+  }
+}
+
+loadChatState();
 
 async function sendCommandResponse(chatId, text) {
   if (!sock || connectionState !== 'connected') return;
@@ -201,12 +226,14 @@ async function startSocket() {
       if (trimmed === '/start' || trimmed === '/continue') {
         const wasAlreadyActive = chatState.get(chatId) === true;
         chatState.set(chatId, true);
+        saveChatState();
         sendCommandResponse(chatId, wasAlreadyActive ? 'Hermes ya esta activo' : 'Hermes chat iniciado');
         continue;
       }
       if (trimmed === '/stop') {
         const wasAlreadyPaused = chatState.get(chatId) !== true;
         chatState.set(chatId, false);
+        saveChatState();
         sendCommandResponse(chatId, wasAlreadyPaused ? 'Hermes ya esta pausado' : 'Hermes chat pausado');
         continue;
       }
@@ -217,11 +244,18 @@ async function startSocket() {
         const chatNumber = chatId.replace(/@.*/, '');
         if (myNumber && chatNumber === myNumber) {
           chatState.set(chatId, true);
+          saveChatState();
         }
       }
 
       // Skip messages from inactive chats (must /start first)
       if (chatState.get(chatId) !== true) {
+        // Send a one-time hint (only once per chat per session to avoid spam)
+        if (!chatState.has(chatId)) {
+          chatState.set(chatId, false);  // Mark as seen-but-inactive
+          saveChatState();
+          sendCommandResponse(chatId, 'Envía */start* para activar Hermes en este chat.');
+        }
         continue;
       }
 
