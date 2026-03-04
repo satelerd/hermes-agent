@@ -54,6 +54,46 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+def _digits_only(value: str) -> str:
+    """Keep only digits (useful for comparing phone identifiers)."""
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _is_owner_origin(origin: Optional[dict]) -> bool:
+    """
+    Return True if the origin appears to be the configured WhatsApp owner.
+
+    Cron jobs run outside live chat sessions, so they don't go through gateway
+    owner detection. We replicate the check here so owner-origin cron runs can
+    use local terminal backend (full host access) when needed.
+    """
+    if not origin:
+        return False
+
+    platform = str(origin.get("platform", "")).lower()
+    if platform != "whatsapp":
+        return False
+
+    chat_id_digits = _digits_only(origin.get("chat_id", ""))
+    if not chat_id_digits:
+        return False
+
+    try:
+        import yaml
+        config_path = _hermes_home / "config.yaml"
+        if not config_path.exists():
+            return False
+
+        cfg = yaml.safe_load(config_path.read_text()) or {}
+        owner_whatsapp = _digits_only(cfg.get("owner_whatsapp", ""))
+        if not owner_whatsapp:
+            return False
+
+        return chat_id_digits == owner_whatsapp or owner_whatsapp in chat_id_digits
+    except Exception:
+        return False
+
+
 def _deliver_result(job: dict, content: str) -> None:
     """
     Deliver job output to the configured target (origin chat, specific platform, etc.).
@@ -156,12 +196,22 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
+    previous_terminal_env = os.environ.get("TERMINAL_ENV")
+    terminal_env_overridden = False
+
     # Inject origin context so the agent's send_message tool knows the chat
     if origin:
         os.environ["HERMES_SESSION_PLATFORM"] = origin["platform"]
         os.environ["HERMES_SESSION_CHAT_ID"] = str(origin["chat_id"])
         if origin.get("chat_name"):
             os.environ["HERMES_SESSION_CHAT_NAME"] = origin["chat_name"]
+
+        # Cron runs outside live chat session routing. For owner-origin WhatsApp
+        # jobs, force local backend so absolute host paths (e.g. /home/sat/...) work.
+        if _is_owner_origin(origin):
+            os.environ["TERMINAL_ENV"] = "local"
+            terminal_env_overridden = True
+            logger.info("Job '%s': forcing TERMINAL_ENV=local for owner origin %s", job_name, origin.get("chat_id"))
 
     try:
         # Re-read .env and config.yaml fresh every run so provider/key
@@ -262,6 +312,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Clean up injected env vars so they don't leak to other jobs
         for key in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME"):
             os.environ.pop(key, None)
+
+        if terminal_env_overridden:
+            if previous_terminal_env is None:
+                os.environ.pop("TERMINAL_ENV", None)
+            else:
+                os.environ["TERMINAL_ENV"] = previous_terminal_env
 
 
 def tick(verbose: bool = True) -> int:

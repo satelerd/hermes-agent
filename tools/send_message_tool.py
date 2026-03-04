@@ -160,6 +160,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message):
         return await _send_discord(pconfig.token, chat_id, message)
     elif platform == Platform.SLACK:
         return await _send_slack(pconfig.token, chat_id, message)
+    elif platform == Platform.WHATSAPP:
+        return await _send_whatsapp(chat_id, message)
     return {"error": f"Direct sending not yet implemented for {platform.value}"}
 
 
@@ -217,6 +219,102 @@ async def _send_slack(token, chat_id, message):
                 return {"error": f"Slack API error: {data.get('error', 'unknown')}"}
     except Exception as e:
         return {"error": f"Slack send failed: {e}"}
+
+
+async def _send_whatsapp(chat_id, message):
+    """Send via local WhatsApp bridge, with MEDIA:/path support."""
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
+    bridge_port = int(os.getenv("WHATSAPP_BRIDGE_PORT", "3000"))
+
+    # Cron-delivered content can sometimes contain escaped newlines (\n)
+    # around MEDIA tags. Normalize before extraction.
+    normalized = message
+    if "MEDIA:" in normalized and "\n" in normalized:
+        normalized = normalized.replace("\\r\\n", "\n").replace("\\n", "\n")
+
+    try:
+        from gateway.platforms.base import BasePlatformAdapter
+        media_files, text_content = BasePlatformAdapter.extract_media(normalized)
+    except Exception:
+        media_files, text_content = [], normalized
+
+    cleaned_media = []
+    for media_path, is_voice in media_files:
+        path = str(media_path).split("\n", 1)[0].split("\r", 1)[0].strip().strip("'\"")
+        if path:
+            cleaned_media.append((path, is_voice))
+
+    _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
+    _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.3gp'}
+    _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+
+    sent_ids = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Send text first (if any)
+            if text_content and text_content.strip():
+                async with session.post(
+                    f"http://localhost:{bridge_port}/send",
+                    json={"chatId": chat_id, "message": text_content.strip()},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        return {"error": f"WhatsApp bridge /send error ({resp.status}): {body}"}
+                    data = await resp.json()
+                    sent_ids.append(data.get("messageId"))
+
+            # Then send native media attachments
+            for media_path, is_voice in cleaned_media:
+                ext = os.path.splitext(media_path)[1].lower()
+
+                if ext in _AUDIO_EXTS and is_voice:
+                    endpoint = "/send-audio"
+                    payload = {"chatId": chat_id, "audioPath": media_path}
+                    timeout = aiohttp.ClientTimeout(total=60)
+                else:
+                    if ext in _VIDEO_EXTS:
+                        media_type = "video"
+                    elif ext in _IMAGE_EXTS:
+                        media_type = "image"
+                    elif ext in _AUDIO_EXTS:
+                        media_type = "audio"
+                    else:
+                        media_type = "document"
+
+                    endpoint = "/send-media"
+                    payload = {
+                        "chatId": chat_id,
+                        "filePath": media_path,
+                        "mediaType": media_type,
+                    }
+                    if media_type == "document":
+                        payload["fileName"] = os.path.basename(media_path)
+                    timeout = aiohttp.ClientTimeout(total=120)
+
+                async with session.post(
+                    f"http://localhost:{bridge_port}{endpoint}",
+                    json=payload,
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        return {"error": f"WhatsApp bridge {endpoint} error ({resp.status}): {body}"}
+                    data = await resp.json()
+                    sent_ids.append(data.get("messageId"))
+    except Exception as e:
+        return {"error": f"WhatsApp send failed: {e}"}
+
+    return {
+        "success": True,
+        "platform": "whatsapp",
+        "chat_id": chat_id,
+        "message_ids": [m for m in sent_ids if m],
+    }
 
 
 def _check_send_message():

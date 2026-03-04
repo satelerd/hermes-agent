@@ -2632,6 +2632,23 @@ class AIAgent:
         """Request a summary when max iterations are reached. Returns the final response text."""
         print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
 
+        # Compress context before attempting the summary call — after 60 iterations
+        # the messages are likely near or past the context window limit, which would
+        # cause the summary API call to fail with "input exceeds context window".
+        if self.compression_enabled and self.context_compressor:
+            try:
+                rough_tokens = estimate_messages_tokens_rough(messages)
+                # Compress if we're above 70% of context (lower than normal 85% threshold
+                # because we need room for the summary request + response)
+                compress_threshold = int(self.context_compressor.context_length * 0.70)
+                if rough_tokens >= compress_threshold:
+                    print(f"   📦 Pre-summary compression ({rough_tokens:,} tokens ≥ {compress_threshold:,} threshold)")
+                    messages[:], _ = self._compress_context(
+                        messages, None, approx_tokens=rough_tokens
+                    )
+            except Exception as comp_err:
+                logging.warning(f"Pre-summary compression failed: {comp_err}")
+
         summary_request = (
             "You've reached the maximum number of tool-calling iterations allowed. "
             "Please provide a final response summarizing what you've found and accomplished so far, "
@@ -2697,7 +2714,11 @@ class AIAgent:
 
                 summary_response = self.client.chat.completions.create(**summary_kwargs)
 
-                if summary_response.choices and summary_response.choices[0].message.content:
+                if (summary_response is not None
+                        and hasattr(summary_response, 'choices')
+                        and summary_response.choices is not None
+                        and len(summary_response.choices) > 0
+                        and summary_response.choices[0].message.content):
                     final_response = summary_response.choices[0].message.content
                 else:
                     final_response = ""
@@ -2729,7 +2750,11 @@ class AIAgent:
 
                     summary_response = self.client.chat.completions.create(**summary_kwargs)
 
-                    if summary_response.choices and summary_response.choices[0].message.content:
+                    if (summary_response is not None
+                            and hasattr(summary_response, 'choices')
+                            and summary_response.choices is not None
+                            and len(summary_response.choices) > 0
+                            and summary_response.choices[0].message.content):
                         final_response = summary_response.choices[0].message.content
                     else:
                         final_response = ""

@@ -242,13 +242,13 @@ TOOLSETS = {
     },
 
     "hermes-whatsapp-sandboxed": {
-        "description": "Sandboxed WhatsApp toolset for non-owner users (no terminal, no file writes)",
+        "description": "Sandboxed WhatsApp toolset for non-owner users (no terminal, no file writes, no memory)",
         "tools": [
             "web_search", "web_extract",
             "read_file", "search_files",
             "vision_analyze", "image_generate",
             "text_to_speech",
-            "todo", "memory",
+            "todo",
             "clarify",
             "execute_code",
         ],
