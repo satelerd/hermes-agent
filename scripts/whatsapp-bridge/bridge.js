@@ -55,43 +55,8 @@ const MAX_QUEUE_SIZE = 100;
 let sock = null;
 let connectionState = 'disconnected';
 
-// Per-chat active/paused state (true = active, false = paused)
-// Default: paused (not in map means paused — user must /start first)
-// Persisted to disk so state survives restarts.
-const CHAT_STATE_FILE = path.join(SESSION_DIR, 'chat_state.json');
-const chatState = new Map();
-
-function loadChatState() {
-  try {
-    if (existsSync(CHAT_STATE_FILE)) {
-      const data = JSON.parse(readFileSync(CHAT_STATE_FILE, 'utf8'));
-      for (const [k, v] of Object.entries(data)) chatState.set(k, v);
-      console.log(`📋 Loaded chat state: ${chatState.size} chats`);
-    }
-  } catch (err) {
-    console.error('Failed to load chat state:', err.message);
-  }
-}
-
-function saveChatState() {
-  try {
-    const obj = Object.fromEntries(chatState);
-    writeFileSync(CHAT_STATE_FILE, JSON.stringify(obj, null, 2));
-  } catch (err) {
-    console.error('Failed to save chat state:', err.message);
-  }
-}
-
-loadChatState();
-
-async function sendCommandResponse(chatId, text) {
-  if (!sock || connectionState !== 'connected') return;
-  try {
-    await sock.sendMessage(chatId, { text: `⚕ *Hermes Agent*\n────────────\n${text}` });
-  } catch (err) {
-    console.error('Failed to send command response:', err.message);
-  }
-}
+// Chat gating is handled in gateway/run.py.
+// The bridge intentionally stays stateless and only forwards events.
 
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -152,7 +117,7 @@ async function startSocket() {
       if (!msg.message) continue;
 
       const chatId = msg.key.remoteJid;
-      const senderId = msg.key.participant || chatId;
+      let senderId = msg.key.participant || chatId;
       const isGroup = chatId.endsWith('@g.us');
       const senderNumber = senderId.replace(/@.*/, '');
 
@@ -164,7 +129,7 @@ async function startSocket() {
         // Quick-extract text to check for commands and owner override
         const quickBody = (msg.message.conversation || msg.message.extendedTextMessage?.text || '').trim();
         const quickLower = quickBody.toLowerCase();
-        const isCommand = quickLower === '/start' || quickLower === '/continue' || quickLower === '/stop';
+        const isCommand = quickLower === '/start' || quickLower === '/continue' || quickLower === '/stop' || quickLower === '/approve' || quickLower === '/go' || quickLower === '/apruebo' || quickLower === '/approved';
         // Owner override: message starts with * — forward to agent in any active chat
         const isOverride = quickBody.startsWith('*') && quickBody.length > 1;
 
@@ -179,6 +144,15 @@ async function startSocket() {
         }
         if (isOverride) ownerOverride = true;
         // Commands and overrides from owner fall through to be handled below
+      }
+
+      // For fromMe messages in DMs, use own JID as senderId so Python
+      // can identify the owner (otherwise senderId = remote party's JID).
+      if (msg.key.fromMe && !isGroup) {
+        const myJid = (sock.user?.id || '').replace(/:.*@/, '@');
+        if (myJid) {
+          senderId = myJid;
+        }
       }
 
       // Check allowlist for messages from others
@@ -200,14 +174,34 @@ async function startSocket() {
         body = msg.message.imageMessage.caption || '';
         hasMedia = true;
         mediaType = 'image';
+        try {
+          const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const ext = (msg.message.imageMessage.mimetype || 'image/jpeg').includes('png') ? 'png' : 'jpg';
+          const filename = `image_${randomBytes(6).toString('hex')}.${ext}`;
+          const filepath = path.join(MEDIA_CACHE_DIR, filename);
+          writeFileSync(filepath, buffer);
+          mediaUrls.push(`http://localhost:${PORT}/media/${filename}`);
+          console.log(`📷 Cached image: ${filename} (${buffer.length} bytes)`);
+        } catch (dlErr) {
+          console.error('Failed to download image:', dlErr.message);
+        }
       } else if (msg.message.videoMessage) {
         body = msg.message.videoMessage.caption || '';
         hasMedia = true;
         mediaType = 'video';
+        try {
+          const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const filename = `video_${randomBytes(6).toString('hex')}.mp4`;
+          const filepath = path.join(MEDIA_CACHE_DIR, filename);
+          writeFileSync(filepath, buffer);
+          mediaUrls.push(`http://localhost:${PORT}/media/${filename}`);
+          console.log(`🎬 Cached video: ${filename} (${buffer.length} bytes)`);
+        } catch (dlErr) {
+          console.error('Failed to download video:', dlErr.message);
+        }
       } else if (msg.message.audioMessage || msg.message.pttMessage) {
         hasMedia = true;
         mediaType = msg.message.pttMessage ? 'ptt' : 'audio';
-        // Download audio to local cache so gateway can transcribe it
         try {
           const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
           const filename = `audio_${randomBytes(6).toString('hex')}.ogg`;
@@ -219,9 +213,21 @@ async function startSocket() {
           console.error('Failed to download audio:', dlErr.message);
         }
       } else if (msg.message.documentMessage) {
-        body = msg.message.documentMessage.caption || msg.message.documentMessage.fileName || '';
+        body = msg.message.documentMessage.caption || '';
         hasMedia = true;
         mediaType = 'document';
+        try {
+          const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const origName = msg.message.documentMessage.fileName || 'file';
+          const ext = origName.includes('.') ? origName.split('.').pop() : 'bin';
+          const filename = `doc_${randomBytes(6).toString('hex')}_${origName}`;
+          const filepath = path.join(MEDIA_CACHE_DIR, filename);
+          writeFileSync(filepath, buffer);
+          mediaUrls.push(`http://localhost:${PORT}/media/${filename}`);
+          console.log(`📎 Cached document: ${filename} (${buffer.length} bytes)`);
+        } catch (dlErr) {
+          console.error('Failed to download document:', dlErr.message);
+        }
       }
 
       // Skip empty messages
@@ -233,41 +239,9 @@ async function startSocket() {
         if (!body && !hasMedia) continue; // Nothing left after stripping
       }
 
-      // Handle /start, /continue, /stop commands (case-insensitive)
-      const trimmed = body.trim().toLowerCase();
-      if (trimmed === '/start' || trimmed === '/continue') {
-        const wasAlreadyActive = chatState.get(chatId) === true;
-        chatState.set(chatId, true);
-        saveChatState();
-        sendCommandResponse(chatId, wasAlreadyActive ? 'Hermes ya esta activo' : 'Hermes chat iniciado');
-        continue;
-      }
-      if (trimmed === '/stop') {
-        const wasAlreadyPaused = chatState.get(chatId) !== true;
-        chatState.set(chatId, false);
-        saveChatState();
-        sendCommandResponse(chatId, wasAlreadyPaused ? 'Hermes ya esta pausado' : 'Hermes chat pausado');
-        continue;
-      }
-
-      // Self-chat is active by default (no /start needed)
-      if (!chatState.has(chatId)) {
-        const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const chatNumber = chatId.replace(/@.*/, '');
-        if (myNumber && chatNumber === myNumber) {
-          chatState.set(chatId, true);
-          saveChatState();
-        }
-      }
-
-      // Skip messages from inactive chats (must /start first)
-      if (chatState.get(chatId) !== true) {
-        if (!chatState.has(chatId)) {
-          chatState.set(chatId, false);  // Mark as seen-but-inactive
-          saveChatState();
-        }
-        continue;
-      }
+      // IMPORTANT: WhatsApp chat approval is handled in gateway/run.py
+      // (/start -> owner /approved -> user /start). The bridge must not
+      // consume those commands or gate chats locally; just forward events.
 
       const event = {
         messageId: msg.key.id,
@@ -371,6 +345,76 @@ app.post('/send-audio', async (req, res) => {
       mimetype,
       ptt: ext === 'ogg' || ext === 'opus',  // Only PTT for opus-compatible formats
     });
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// MIME type map and media type inference for /send-media
+const MIME_MAP = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+  webp: 'image/webp', gif: 'image/gif',
+  mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo',
+  mkv: 'video/x-matroska', '3gp': 'video/3gpp',
+  pdf: 'application/pdf',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+};
+
+function inferMediaType(ext) {
+  if (['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)) return 'image';
+  if (['mp4', 'mov', 'avi', 'mkv', '3gp'].includes(ext)) return 'video';
+  if (['ogg', 'opus', 'mp3', 'wav', 'm4a'].includes(ext)) return 'audio';
+  return 'document';
+}
+
+// Send media (image, video, document) natively
+app.post('/send-media', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, filePath, mediaType, caption, fileName } = req.body;
+  if (!chatId || !filePath) {
+    return res.status(400).json({ error: 'chatId and filePath are required' });
+  }
+
+  try {
+    if (!existsSync(filePath)) {
+      return res.status(404).json({ error: `File not found: ${filePath}` });
+    }
+
+    const buffer = readFileSync(filePath);
+    const ext = filePath.toLowerCase().split('.').pop();
+    const type = mediaType || inferMediaType(ext);
+    let msgPayload;
+
+    switch (type) {
+      case 'image':
+        msgPayload = { image: buffer, caption: caption || undefined, mimetype: MIME_MAP[ext] || 'image/jpeg' };
+        break;
+      case 'video':
+        msgPayload = { video: buffer, caption: caption || undefined, mimetype: MIME_MAP[ext] || 'video/mp4' };
+        break;
+      case 'audio': {
+        const audioMime = (ext === 'ogg' || ext === 'opus') ? 'audio/ogg; codecs=opus' : 'audio/mpeg';
+        msgPayload = { audio: buffer, mimetype: audioMime, ptt: ext === 'ogg' || ext === 'opus' };
+        break;
+      }
+      case 'document':
+      default:
+        msgPayload = {
+          document: buffer,
+          fileName: fileName || path.basename(filePath),
+          caption: caption || undefined,
+          mimetype: MIME_MAP[ext] || 'application/octet-stream',
+        };
+        break;
+    }
+
+    const sent = await sock.sendMessage(chatId, msgPayload);
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });

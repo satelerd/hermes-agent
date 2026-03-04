@@ -36,6 +36,7 @@ from gateway.platforms.base import (
     SendResult,
     cache_image_from_url,
     cache_audio_from_url,
+    cache_document_from_bytes,
 )
 
 
@@ -164,8 +165,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     "--port", str(self._bridge_port),
                     "--session", str(self._session_path),
                 ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=open("/tmp/bridge_stdout.log", "w"),
+                stderr=open("/tmp/bridge_stderr.log", "w"),
                 preexec_fn=os.setsid,
             )
             
@@ -379,6 +380,101 @@ class WhatsAppAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    async def _send_media_to_bridge(
+        self,
+        chat_id: str,
+        file_path: str,
+        media_type: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> SendResult:
+        """Send any media file via bridge /send-media endpoint."""
+        if not self._running:
+            return SendResult(success=False, error="Not connected")
+        try:
+            import aiohttp
+
+            if not os.path.exists(file_path):
+                return SendResult(success=False, error=f"File not found: {file_path}")
+
+            payload: Dict[str, Any] = {
+                "chatId": chat_id,
+                "filePath": file_path,
+                "mediaType": media_type,
+            }
+            if caption:
+                payload["caption"] = caption
+            if file_name:
+                payload["fileName"] = file_name
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://localhost:{self._bridge_port}/send-media",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return SendResult(
+                            success=True,
+                            message_id=data.get("messageId"),
+                            raw_response=data,
+                        )
+                    else:
+                        error = await resp.text()
+                        return SendResult(success=False, error=error)
+
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Download image URL to cache, send natively via bridge."""
+        try:
+            local_path = await cache_image_from_url(image_url)
+            return await self._send_media_to_bridge(chat_id, local_path, "image", caption)
+        except Exception:
+            return await super().send_image(chat_id, image_url, caption, reply_to)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Send a local image file natively via bridge."""
+        return await self._send_media_to_bridge(chat_id, image_path, "image", caption)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Send a video natively via bridge — plays inline in WhatsApp."""
+        return await self._send_media_to_bridge(chat_id, video_path, "video", caption)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Send a document/file as a downloadable attachment via bridge."""
+        return await self._send_media_to_bridge(
+            chat_id, file_path, "document", caption,
+            file_name or os.path.basename(file_path),
+        )
+
     async def send_typing(self, chat_id: str) -> None:
         """Send typing indicator via bridge."""
         if not self._running:
@@ -505,6 +601,37 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         print(f"[{self.name}] Failed to cache voice: {e}", flush=True)
                         cached_urls.append(url)
                         media_types.append("audio/ogg")
+                elif msg_type == MessageType.DOCUMENT and url.startswith(("http://", "https://")):
+                    try:
+                        import httpx
+                        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                            resp = await client.get(url)
+                            resp.raise_for_status()
+                            # Extract original filename from URL (doc_xxx_originalname.ext)
+                            url_filename = url.split("/")[-1]
+                            cached_path = cache_document_from_bytes(resp.content, url_filename)
+                            cached_urls.append(cached_path)
+                            media_types.append("application/octet-stream")
+                            print(f"[{self.name}] Cached user document: {cached_path}", flush=True)
+                    except Exception as e:
+                        print(f"[{self.name}] Failed to cache document: {e}", flush=True)
+                        cached_urls.append(url)
+                        media_types.append("application/octet-stream")
+                elif msg_type == MessageType.VIDEO and url.startswith(("http://", "https://")):
+                    try:
+                        import httpx
+                        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+                            resp = await client.get(url)
+                            resp.raise_for_status()
+                            url_filename = url.split("/")[-1]
+                            cached_path = cache_document_from_bytes(resp.content, url_filename)
+                            cached_urls.append(cached_path)
+                            media_types.append("video/mp4")
+                            print(f"[{self.name}] Cached user video: {cached_path}", flush=True)
+                    except Exception as e:
+                        print(f"[{self.name}] Failed to cache video: {e}", flush=True)
+                        cached_urls.append(url)
+                        media_types.append("video/mp4")
                 else:
                     cached_urls.append(url)
                     media_types.append("unknown")

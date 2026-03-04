@@ -156,6 +156,12 @@ class GatewayRunner:
     Manages the lifecycle of all platform adapters and routes
     messages to/from the agent.
     """
+
+    # Virtual namespaces in PairingStore for WhatsApp gate.
+    # - PREAPPROVAL: owner accepted chat, waiting for user to send /start again
+    # - APPROVAL: fully enabled chat (can use the bot normally)
+    WHATSAPP_CHAT_PREAPPROVAL_SCOPE = "whatsapp-chat-preapproved"
+    WHATSAPP_CHAT_APPROVAL_SCOPE = "whatsapp-chat"
     
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
@@ -523,17 +529,30 @@ class GatewayRunner:
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
-        
+
         Checks in order:
-        1. Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
-        2. Environment variable allowlists (TELEGRAM_ALLOWED_USERS, etc.)
-        3. DM pairing approved list
-        4. Global allow-all (GATEWAY_ALLOW_ALL_USERS=true)
-        5. Default: deny
+        1. Owner override (WhatsApp owner from config.yaml)
+        2. Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
+        3. Environment variable allowlists (TELEGRAM_ALLOWED_USERS, etc.)
+        4. DM pairing approved list
+        5. Global allow-all (GATEWAY_ALLOW_ALL_USERS=true)
+        6. Default: deny
+
+        Note: when WhatsApp chat-gate mode is enabled, user-level auth is bypassed
+        for WhatsApp chats and handled by per-chat approval via /start + /approved.
         """
         user_id = source.user_id
         if not user_id:
             return False
+
+        # Always allow the configured WhatsApp owner.
+        if source.platform == Platform.WHATSAPP and self._is_owner(source):
+            return True
+
+        # In WhatsApp chat-gate mode, everyone can reach the gate handler; chat-level
+        # approval is enforced later by _is_whatsapp_chat_approved().
+        if source.platform == Platform.WHATSAPP and self._is_whatsapp_chat_gate_enabled():
+            return True
 
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
@@ -578,7 +597,231 @@ class GatewayRunner:
         if "@" in user_id:
             check_ids.add(user_id.split("@")[0])
         return bool(check_ids & allowed_ids)
-    
+
+    def _is_whatsapp_chat_gate_enabled(self) -> bool:
+        """Return True if WhatsApp per-chat approval gate is enabled."""
+        raw = os.getenv("WHATSAPP_CHAT_APPROVAL_REQUIRED", "").strip().lower()
+        if raw:
+            return raw in ("1", "true", "yes", "on")
+
+        # Safe default for SmartUp office setup: if owner_whatsapp is configured,
+        # gate WhatsApp chats by explicit owner approval.
+        try:
+            config_path = _hermes_home / 'config.yaml'
+            if not config_path.exists():
+                return False
+            import yaml
+            with open(config_path, 'r') as f:
+                cfg = yaml.safe_load(f) or {}
+            return bool(str(cfg.get("owner_whatsapp", "")).strip())
+        except Exception:
+            return False
+
+    def _owner_whatsapp_number(self) -> str:
+        """Return owner_whatsapp from config.yaml (digits only), or empty string."""
+        try:
+            config_path = _hermes_home / 'config.yaml'
+            if not config_path.exists():
+                return ""
+            import yaml
+            with open(config_path, 'r') as f:
+                cfg = yaml.safe_load(f) or {}
+            owner = str(cfg.get("owner_whatsapp", "") or "").strip()
+            return re.sub(r"\D", "", owner)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _normalize_whatsapp_chat_id(chat_id: str) -> str:
+        """Normalize WhatsApp IDs to the JID format expected by the bridge."""
+        value = str(chat_id or "").strip()
+        if not value:
+            return ""
+        if "@" in value:
+            return value
+        digits = re.sub(r"\D", "", value)
+        if not digits:
+            return value
+        return f"{digits}@s.whatsapp.net"
+
+    def _owner_whatsapp_chat_id(self) -> str:
+        """Return owner chat_id as WhatsApp JID (e.g., 569...@s.whatsapp.net)."""
+        owner_digits = self._owner_whatsapp_number()
+        if not owner_digits:
+            return ""
+        return f"{owner_digits}@s.whatsapp.net"
+
+    def _is_whatsapp_chat_approved(self, source: SessionSource) -> bool:
+        """Check whether this WhatsApp chat_id has been fully approved."""
+        if source.platform != Platform.WHATSAPP:
+            return True
+        if not self._is_whatsapp_chat_gate_enabled():
+            return True
+        # Owner bypass only for their own chat (not other people's chats)
+        if self._is_owner(source):
+            chat_id = self._normalize_whatsapp_chat_id(source.chat_id)
+            owner_chat_id = self._owner_whatsapp_chat_id()
+            if chat_id == owner_chat_id:
+                return True
+            # In other people's chats, owner must also /approve + /start
+            return self.pairing_store.is_approved(self.WHATSAPP_CHAT_APPROVAL_SCOPE, chat_id)
+
+        chat_id = self._normalize_whatsapp_chat_id(source.chat_id)
+        if not chat_id:
+            return False
+
+        # Strict per-chat gate: approval is bound to chat_id only (no user-level inheritance).
+        return self.pairing_store.is_approved(self.WHATSAPP_CHAT_APPROVAL_SCOPE, chat_id)
+
+    async def _notify_owner_whatsapp_approval_request(self, source: SessionSource, code: str) -> None:
+        """Send a pending-chat approval request to the configured owner chat."""
+        owner_chat_id = self._owner_whatsapp_chat_id()
+        if not owner_chat_id:
+            logger.warning("WhatsApp chat gate: owner_whatsapp not configured; cannot notify owner")
+            return
+
+        adapter = self.adapters.get(Platform.WHATSAPP)
+        if not adapter:
+            return
+
+        display = source.user_name or source.chat_name or source.user_id or source.chat_id
+        chat_id = self._normalize_whatsapp_chat_id(source.chat_id)
+        chat_type = source.chat_type or "dm"
+
+        msg = (
+            "🔐 Nueva solicitud de aprobación (WhatsApp)\n\n"
+            f"• Chat: {display}\n"
+            f"• Tipo: {chat_type}\n"
+            f"• Chat ID: `{chat_id}`\n"
+            f"• Código: `{code}`\n\n"
+            "Para aprobar: `/approved <código>`\n"
+            "Ej: `/approved " + code + "`"
+        )
+
+        try:
+            await adapter.send(owner_chat_id, msg)
+        except Exception as e:
+            logger.warning("Failed to notify owner approval request: %s", e)
+
+    async def _handle_unapproved_whatsapp_chat(self, event: MessageEvent, command: Optional[str]) -> Optional[str]:
+        """Gate unapproved WhatsApp chats. Complete silence until owner /approve-s."""
+        source = event.source
+        chat_id = self._normalize_whatsapp_chat_id(source.chat_id)
+
+        if command == "start" and chat_id:
+            # If owner already approved this chat via /approve, /start activates it.
+            if self.pairing_store.is_approved(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE, chat_id):
+                display_name = source.user_name or source.chat_name or source.user_id or chat_id
+                self.pairing_store._approve_user(
+                    self.WHATSAPP_CHAT_APPROVAL_SCOPE,
+                    chat_id,
+                    display_name,
+                )
+                self.pairing_store.revoke(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE, chat_id)
+                adapter = self.adapters.get(Platform.WHATSAPP)
+                if adapter:
+                    await adapter.send(
+                        source.chat_id,
+                        "✅ Chat activado. Ahora sí te respondo normal 🙌"
+                    )
+                return None
+
+            # Already fully active (idempotent /start).
+            if self.pairing_store.is_approved(self.WHATSAPP_CHAT_APPROVAL_SCOPE, chat_id):
+                adapter = self.adapters.get(Platform.WHATSAPP)
+                if adapter:
+                    await adapter.send(source.chat_id, "✅ Este chat ya está habilitado 👌")
+                return None
+
+        # Everything else: complete silence. No response, no notification.
+        # Owner must send /approve in this chat to unlock it.
+        return None
+
+    async def _handle_approved_command(self, event: MessageEvent) -> str:
+        """Owner command to approve WhatsApp chats. /approve in a chat activates it directly."""
+        source = event.source
+        if source.platform != Platform.WHATSAPP:
+            return "`/approve` aplica solo para WhatsApp."
+
+        if not self._is_owner(source):
+            return "🚫 Solo el dueño puede usar `/approve`."
+
+        args = event.get_command_args().strip()
+        adapter = self.adapters.get(Platform.WHATSAPP)
+        chat_id = self._normalize_whatsapp_chat_id(source.chat_id)
+        owner_chat_id = self._owner_whatsapp_chat_id()
+
+        # Owner sends /approve directly in someone else's chat -> activate that chat
+        if not args and chat_id and chat_id != owner_chat_id:
+            display_name = source.chat_name or source.user_name or chat_id
+            self.pairing_store._approve_user(
+                self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE,
+                chat_id,
+                display_name,
+            )
+            return "✅ Chat aprobado. Ahora pueden usar /start para activar y /stop para pausar."
+
+        if not args:
+            pending = self.pairing_store.list_pending(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE)
+            if pending:
+                lines = ["Pendientes de aprobación:"]
+                for item in pending[:10]:
+                    who = item.get("user_name") or item.get("user_id")
+                    lines.append(f"• `{item['code']}` — {who} ({item['age_minutes']} min)")
+                lines.append("\nAprueba con: `/approved <código>`")
+                return "\n".join(lines)
+            return "No hay chats pendientes. Usa `/approved <chat_id>` o espera un `/start`."
+
+        arg = args.split()[0].strip()
+        lower = arg.lower()
+
+        if lower in ("list", "ls"):
+            active = self.pairing_store.list_approved(self.WHATSAPP_CHAT_APPROVAL_SCOPE)
+            preapproved = self.pairing_store.list_approved(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE)
+            pending = self.pairing_store.list_pending(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE)
+            lines = [
+                f"✅ Activos: {len(active)}",
+                f"🟡 Preaprobados (falta /start): {len(preapproved)}",
+                f"⏳ Pendientes: {len(pending)}",
+            ]
+            for item in preapproved[-10:]:
+                who = item.get("user_name") or item.get("user_id")
+                lines.append(f"• {who}")
+            return "\n".join(lines)
+
+        # First, treat argument as pending code.
+        approved = self.pairing_store.approve_code(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE, arg)
+        if approved:
+            target_chat = self._normalize_whatsapp_chat_id(approved.get("user_id", ""))
+            who = approved.get("user_name") or target_chat
+            if adapter and target_chat:
+                try:
+                    await adapter.send(
+                        target_chat,
+                        "✅ Listo, el dueño aprobó este chat. "
+                        "Ahora manda `/start` para activarlo 🙌"
+                    )
+                except Exception as e:
+                    logger.debug("Could not notify preapproved chat %s: %s", target_chat, e)
+            return f"✅ Chat preaprobado: {who} ({target_chat}). Falta que manden `/start`."
+
+        # Fallback: treat argument as explicit chat_id and preapprove directly.
+        explicit_chat = self._normalize_whatsapp_chat_id(arg)
+        if not explicit_chat:
+            return "Formato inválido. Usa `/approved <código>` o `/approved <chat_id>`"
+
+        self.pairing_store._approve_user(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE, explicit_chat, "")
+        if adapter:
+            try:
+                await adapter.send(
+                    explicit_chat,
+                    "✅ Este chat fue preaprobado manualmente por el dueño. "
+                    "Manda `/start` para activarlo 🙌"
+                )
+            except Exception:
+                pass
+        return f"✅ Chat preaprobado manualmente: `{explicit_chat}`. Falta `/start`."
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -593,7 +836,56 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
-        
+        command = event.get_command()
+
+        # WhatsApp per-chat gate: owner /approve -> user /start -> active.
+        if source.platform == Platform.WHATSAPP and self._is_whatsapp_chat_gate_enabled():
+            logger.info("GATE: user_id=%r chat_id=%r command=%r is_owner=%s", source.user_id, source.chat_id, command, self._is_owner(source))
+            # Owner approve commands (only owner can approve)
+            if command in ("approved", "approve", "go", "apruebo") and self._is_owner(source):
+                logger.info("GATE: owner approve command -> calling _handle_approved_command")
+                return await self._handle_approved_command(event)
+
+            # /start: if chat was preapproved by owner, activate it (anyone can /start)
+            if command == "start":
+                _gate_chat = self._normalize_whatsapp_chat_id(source.chat_id)
+                if _gate_chat:
+                    if self.pairing_store.is_approved(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE, _gate_chat):
+                        _disp = source.user_name or source.chat_name or source.user_id or _gate_chat
+                        self.pairing_store._approve_user(
+                            self.WHATSAPP_CHAT_APPROVAL_SCOPE, _gate_chat, _disp,
+                        )
+                        self.pairing_store.revoke(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE, _gate_chat)
+                        _adapter = self.adapters.get(Platform.WHATSAPP)
+                        if _adapter:
+                            await _adapter.send(source.chat_id, "✅ Chat activado 🙌")
+                        return None
+                    if self.pairing_store.is_approved(self.WHATSAPP_CHAT_APPROVAL_SCOPE, _gate_chat):
+                        return "✅ Este chat ya está habilitado. Dale nomás 🚀"
+                # /start in unapproved chat from non-owner -> silence
+                if not self._is_owner(source):
+                    return None
+
+            # /stop: deactivate this chat (anyone in approved chat, or owner)
+            if command == "stop":
+                _stop_chat = self._normalize_whatsapp_chat_id(source.chat_id)
+                if _stop_chat:
+                    was_approved = self.pairing_store.is_approved(self.WHATSAPP_CHAT_APPROVAL_SCOPE, _stop_chat)
+                    if was_approved:
+                        self.pairing_store.revoke(self.WHATSAPP_CHAT_APPROVAL_SCOPE, _stop_chat)
+                        self.pairing_store.revoke(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE, _stop_chat)
+                        logger.info("GATE: /stop revoked approval for chat %s", _stop_chat)
+                        _adapter = self.adapters.get(Platform.WHATSAPP)
+                        if _adapter:
+                            await _adapter.send(source.chat_id, "\u23f8\ufe0f Chat pausado. Usa /start para reactivar.")
+                        return None
+                # /stop in unapproved chat -> silence
+                return None
+
+            # Non-approved chat: silence
+            if not self._is_whatsapp_chat_approved(source):
+                return None
+
         # Check if user is authorized
         if not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
@@ -641,13 +933,13 @@ class GatewayRunner:
                 self._pending_messages[_quick_key] = event.text
             return None
         
-        # Check for commands
-        command = event.get_command()
+        # Check for commands (already parsed above)
         
         # Emit command:* hook for any recognized slash command
         _known_commands = {"new", "reset", "help", "status", "stop", "model",
                           "personality", "retry", "undo", "sethome", "set-home",
-                          "compress", "usage"}
+                          "compress", "usage", "start", "approved", "approve",
+                          "go", "apruebo"}
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
@@ -689,6 +981,25 @@ class GatewayRunner:
         if command == "usage":
             return await self._handle_usage_command(event)
         
+
+        if command in ("approved", "approve", "go", "apruebo"):
+            return await self._handle_approved_command(event)
+
+        if command == "start" and source.platform == Platform.WHATSAPP:
+            # Check if this is actually a preapproved chat needing activation
+            _start_chat = self._normalize_whatsapp_chat_id(source.chat_id)
+            if _start_chat and self.pairing_store.is_approved(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE, _start_chat):
+                _disp = source.user_name or source.chat_name or source.user_id or _start_chat
+                self.pairing_store._approve_user(
+                    self.WHATSAPP_CHAT_APPROVAL_SCOPE, _start_chat, _disp,
+                )
+                self.pairing_store.revoke(self.WHATSAPP_CHAT_PREAPPROVAL_SCOPE, _start_chat)
+                _adapter = self.adapters.get(Platform.WHATSAPP)
+                if _adapter:
+                    await _adapter.send(source.chat_id, "✅ Chat activado 🙌")
+                return None
+            return "✅ Este chat ya está habilitado. Dale nomás 🚀"
+
         # Skill slash commands: /skill-name loads the skill and sends to agent
         if command:
             try:
@@ -1106,6 +1417,8 @@ class GatewayRunner:
             "`/sethome` — Set this chat as the home channel",
             "`/compress` — Compress conversation context",
             "`/usage` — Show token usage for this session",
+            "`/start` — (WhatsApp) Request or confirm chat activation",
+            "`/approved` — (Owner WhatsApp) Approve pending chats",
             "`/help` — Show this message",
         ]
         try:
