@@ -146,9 +146,9 @@ async function startSocket() {
         // Commands and overrides from owner fall through to be handled below
       }
 
-      // For fromMe messages in DMs, use own JID as senderId so Python
-      // can identify the owner (otherwise senderId = remote party's JID).
-      if (msg.key.fromMe && !isGroup) {
+      // For fromMe messages, use own JID as senderId so Python can
+      // identify the owner (LIDs in groups are not matchable to phone numbers).
+      if (msg.key.fromMe) {
         const myJid = (sock.user?.id || '').replace(/:.*@/, '@');
         if (myJid) {
           senderId = myJid;
